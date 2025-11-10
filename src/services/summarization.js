@@ -1,14 +1,12 @@
-import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { config } from 'dotenv';
 
 config();
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
 /**
- * Summarize transcribed text using OpenAI GPT API
+ * Summarize transcribed text using Google Gemini API
  * @param {string} text - Text to summarize
  * @returns {Promise<string>} - Summary
  */
@@ -16,23 +14,18 @@ export async function summarizeText(text) {
   try {
     console.log('📝 Generating summary...');
 
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a helpful assistant that creates concise summaries of voice chat transcriptions. Focus on key points, decisions made, and action items.',
-        },
-        {
-          role: 'user',
-          content: `Please summarize the following voice chat transcription:\n\n${text}`,
-        },
-      ],
-      temperature: 0.7,
-      max_tokens: 500,
-    });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
-    const summary = response.choices[0].message.content;
+    const prompt = `You are a helpful assistant that creates concise summaries of voice chat transcriptions. Focus on key points, decisions made, and action items.
+
+Please summarize the following voice chat transcription:
+
+${text}`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const summary = response.text();
+
     console.log('✅ Summary generated');
     return summary;
   } catch (error) {
