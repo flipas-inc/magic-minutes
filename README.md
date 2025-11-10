@@ -1,11 +1,11 @@
 # Magic Minutes 🎙️✨
 
-A powerful Discord bot that records voice chats, transcribes them using OpenAI's Whisper API, and generates intelligent summaries using GPT. Never miss important details from your Discord voice conversations!
+A powerful Discord bot that records voice chats, transcribes them using Google Gemini AI, and generates intelligent summaries using GPT. Never miss important details from your Discord voice conversations!
 
 ## Features
 
 - 🎤 **Voice Recording**: Record Discord voice channel conversations with high quality
-- 📝 **AI Transcription**: Automatic transcription using OpenAI's Whisper API
+- 📝 **AI Transcription**: Automatic transcription using Google Gemini AI
 - 📊 **Smart Summaries**: Generate concise summaries of conversations using GPT
 - 👥 **Per-User Recording**: Separate audio streams for each participant
 - 📁 **Easy Access**: Receive recordings, transcriptions, and summaries directly in Discord
@@ -143,7 +143,7 @@ magic-minutes/
 
 2. **Storage**: Audio is saved as `.ogg` files in the `recordings/` directory, organized by server ID.
 
-3. **Transcription**: After stopping the recording, each audio file is sent to OpenAI's Whisper API for transcription.
+3. **Transcription**: After stopping the recording, each audio file is sent to Google Gemini AI for transcription.
 
 4. **Summarization**: The combined transcriptions are sent to GPT-4 to generate a concise summary highlighting key points and action items.
 
