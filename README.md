@@ -17,28 +17,8 @@ Before you begin, ensure you have:
 - [Node.js](https://nodejs.org/) v18 or higher
 - A [Discord Bot Token](https://discord.com/developers/applications)
 - An [OpenAI API Key](https://platform.openai.com/api-keys)
-- FFmpeg installed on your system
 
-### Installing FFmpeg
-
-**Windows:**
-```bash
-# Using Chocolatey
-choco install ffmpeg
-
-# Or download from https://ffmpeg.org/download.html
-```
-
-**Linux (Ubuntu/Debian):**
-```bash
-sudo apt update
-sudo apt install ffmpeg
-```
-
-**macOS:**
-```bash
-brew install ffmpeg
-```
+> **Note:** FFmpeg is included via the `ffmpeg-static` package, so no separate installation is needed!
 
 ## Setup
 
@@ -115,6 +95,8 @@ For development with auto-reload:
 npm run dev
 ```
 
+**⚠️ Important:** When using `npm run dev`, the bot will restart when files change. This will interrupt any active recordings. Use `npm start` for stable recording sessions.
+
 ### Bot Commands
 
 The bot uses Discord slash commands:
@@ -178,6 +160,16 @@ Monitor your usage in the [OpenAI Dashboard](https://platform.openai.com/usage).
 
 ## Troubleshooting
 
+### "No compatible encryption modes" error
+**Fixed in v0.19.0+** - This error occurred in older versions of @discordjs/voice that didn't support Discord's newer AEAD encryption modes. The project now uses @discordjs/voice v0.19.0+ which supports:
+- `aead_aes256_gcm_rtpsize` (via Node.js native crypto)
+- `aead_xchacha20_poly1305_rtpsize` (via libsodium-wrappers)
+
+If you still encounter this error, ensure you're using the correct versions:
+```bash
+npm install
+```
+
 ### Bot doesn't join voice channel
 - Ensure the bot has "Connect" and "Speak" permissions
 - Check that you're in a voice channel when using the command
@@ -189,7 +181,6 @@ Monitor your usage in the [OpenAI Dashboard](https://platform.openai.com/usage).
 
 ### No audio captured
 - Make sure participants are speaking during the recording
-- Verify FFmpeg is properly installed
 - Check bot permissions in the voice channel
 
 ## Contributing
