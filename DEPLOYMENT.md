@@ -43,28 +43,28 @@ gcloud services enable secretmanager.googleapis.com
 Store your sensitive credentials securely:
 
 ```bash
-# Set your project ID
+# Set your project ID (replace with your actual project ID)
 export PROJECT_ID=your-project-id-here
 
-# Create secrets
+# Create secrets (replace YOUR_* with your actual credentials)
 echo -n "YOUR_DISCORD_TOKEN" | gcloud secrets create discord-token --data-file=-
 echo -n "YOUR_CLIENT_ID" | gcloud secrets create discord-client-id --data-file=-
 echo -n "YOUR_GUILD_ID" | gcloud secrets create discord-guild-id --data-file=-
 echo -n "YOUR_GOOGLE_API_KEY" | gcloud secrets create google-api-key --data-file=-
 
-# Grant Cloud Run access to secrets
+# Get project number
 PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format="value(projectNumber)")
-gcloud secrets add-iam-policy-binding discord-token \
-    --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
-    --role="roles/secretmanager.secretAccessor"
-gcloud secrets add-iam-policy-binding discord-client-id \
-    --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
-    --role="roles/secretmanager.secretAccessor"
-gcloud secrets add-iam-policy-binding discord-guild-id \
-    --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
-    --role="roles/secretmanager.secretAccessor"
-gcloud secrets add-iam-policy-binding google-api-key \
-    --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+
+# Grant Cloud Run access to secrets
+for secret in discord-token discord-client-id discord-guild-id google-api-key; do
+    gcloud secrets add-iam-policy-binding $secret \
+        --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+        --role="roles/secretmanager.secretAccessor"
+done
+
+# Grant Cloud Build access to secrets (needed for deployment)
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
     --role="roles/secretmanager.secretAccessor"
 ```
 
@@ -139,21 +139,30 @@ Complete Steps 1-3 from Option 1 above.
 ### Creating Service Account Key:
 
 ```bash
+# Set your project ID
+export PROJECT_ID=your-project-id-here
+
 # Create service account
 gcloud iam service-accounts create github-actions \
     --display-name="GitHub Actions"
 
 # Grant necessary permissions
-export PROJECT_ID=your-project-id-here
 gcloud projects add-iam-policy-binding $PROJECT_ID \
     --member="serviceAccount:github-actions@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/run.admin"
+
 gcloud projects add-iam-policy-binding $PROJECT_ID \
     --member="serviceAccount:github-actions@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/storage.admin"
+
 gcloud projects add-iam-policy-binding $PROJECT_ID \
     --member="serviceAccount:github-actions@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/iam.serviceAccountUser"
+
+# IMPORTANT: Grant permission to push to Container Registry
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:github-actions@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/artifactregistry.writer"
 
 # Create and download key
 gcloud iam service-accounts keys create key.json \
@@ -161,6 +170,9 @@ gcloud iam service-accounts keys create key.json \
 
 # Copy the content of key.json and add it as GCP_SA_KEY secret in GitHub
 cat key.json
+
+# IMPORTANT: Delete key.json after copying to GitHub
+rm key.json
 ```
 
 ### Step 3: GitHub Actions Workflow
