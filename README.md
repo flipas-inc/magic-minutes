@@ -16,9 +16,23 @@ Before you begin, ensure you have:
 
 - [Node.js](https://nodejs.org/) v18 or higher
 - A [Discord Bot Token](https://discord.com/developers/applications)
-- An [OpenAI API Key](https://platform.openai.com/api-keys)
+- A [Google API Key](https://aistudio.google.com/app/apikey) for Gemini AI
 
 > **Note:** FFmpeg is included via the `ffmpeg-static` package, so no separate installation is needed!
+
+## Deployment
+
+### Deploy to Google Cloud Run
+
+For production deployment on Google Cloud with automatic GitHub integration, see the comprehensive [DEPLOYMENT.md](./DEPLOYMENT.md) guide.
+
+Quick overview:
+- Automatic deployments from GitHub
+- Scalable and cost-effective (~$5-15/month)
+- Built-in Secret Manager for secure credentials
+- 24/7 uptime with health checks
+
+### Local Development
 
 ## Setup
 
@@ -49,7 +63,7 @@ Edit `.env` and add your credentials:
 DISCORD_TOKEN=your_discord_bot_token_here
 CLIENT_ID=your_discord_client_id_here
 GUILD_ID=your_discord_server_id_here
-OPENAI_API_KEY=your_openai_api_key_here
+GOOGLE_API_KEY=your_google_api_key_here
 ```
 
 ### 4. Create Discord Bot
@@ -167,8 +181,8 @@ npm install
 - Check that you're in a voice channel when using the command
 
 ### Transcription fails
-- Verify your OpenAI API key is correct
-- Ensure you have sufficient API credits
+- Verify your Google API key is correct
+- Ensure you have sufficient API quota
 - Check that audio files are being created in the `recordings/` folder
 
 ### No audio captured
