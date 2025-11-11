@@ -31,7 +31,7 @@ export async function transcribeAudio(filePath) {
       const result = await model.generateContent([
         {
           inlineData: {
-            mimeType: 'audio/ogg',
+            mimeType: 'audio/mpeg', // matches our MP3 output
             data: base64Audio,
           },
         },

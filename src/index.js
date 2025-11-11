@@ -37,7 +37,7 @@ const client = new Client({
   ],
 });
 
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   
   // Clean up any existing voice connections from previous sessions

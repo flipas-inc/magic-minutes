@@ -12,12 +12,22 @@ import prism from 'prism-media';
 import { mkdir, unlink, readFile, writeFile, appendFile, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import path from 'path';
-import ffmpegPath from 'ffmpeg-static';
+import ffmpegStatic from 'ffmpeg-static';
 import { transcribeAudio } from '../services/transcription.js';
 import { summarizeText } from '../services/summarization.js';
 
 const pipelineAsync = promisify(pipeline);
 const execAsync = promisify(exec);
+
+// Resolve ffmpeg binary: prefer FFMPEG_PATH env, then system binary, else bundled static
+const resolvedFfmpegPath = (() => {
+  if (process.env.FFMPEG_PATH && existsSync(process.env.FFMPEG_PATH)) return process.env.FFMPEG_PATH;
+  // Common system path inside Debian slim image
+  const systemPath = '/usr/bin/ffmpeg';
+  if (existsSync(systemPath)) return systemPath;
+  return ffmpegStatic; // fall back to static module binary
+})();
+console.log(`🎬 Using ffmpeg binary: ${resolvedFfmpegPath}`);
 
 // Store active recordings
 const activeRecordings = new Map();
@@ -275,8 +285,8 @@ async function processRecordings(guildId, recordingData, interaction) {
         console.log(`🔄 Converting to MP3...`);
         
         const { stdout, stderr } = await execAsync(
-          `"${ffmpegPath}" -y -f s16le -ar 48000 -ac 2 -i "${mergedPcmPath}" -b:a 128k "${mergedMp3Path}"`,
-          { timeout: 30000 } // 30 second timeout
+          `"${resolvedFfmpegPath}" -y -f s16le -ar 48000 -ac 2 -i "${mergedPcmPath}" -b:a 128k "${mergedMp3Path}"`,
+          { timeout: 90000, maxBuffer: 10 * 1024 * 1024 } // 90s timeout, larger buffer for stderr
         );
         
         if (stderr) console.log('FFmpeg output:', stderr);
@@ -382,8 +392,8 @@ async function splitAudioIntoChunks(inputPath, recordingsDir, userId, segmentSec
 
     console.log(`🔪 Segmenting audio into ~${segmentSeconds}s chunks for user ${userId}...`);
     // Use ffmpeg segment muxer; reset timestamps for each part
-    const cmd = `"${ffmpegPath}" -y -i "${inputPath}" -c copy -f segment -segment_time ${segmentSeconds} -reset_timestamps 1 "${outPattern}"`;
-    const { stderr } = await execAsync(cmd, { timeout: 60000 });
+  const cmd = `"${resolvedFfmpegPath}" -y -i "${inputPath}" -c copy -f segment -segment_time ${segmentSeconds} -reset_timestamps 1 "${outPattern}"`;
+  const { stderr } = await execAsync(cmd, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 });
     if (stderr) console.log('FFmpeg segment output:', stderr);
 
     // Collect produced chunks (part_000.mp3, part_001.mp3, ...). We'll probe up to 999 just in case.

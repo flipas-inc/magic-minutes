@@ -49,10 +49,13 @@ jobs:
             --region $REGION \
             --platform managed \
             --memory 512Mi \
+            --cpu 1 \
+            --no-cpu-throttling \
             --min-instances 1 \
             --max-instances 1 \
             --allow-unauthenticated \
             --set-env-vars NODE_ENV=production \
+            --execution-environment gen2 \
             --update-secrets DISCORD_TOKEN=discord-token:latest,CLIENT_ID=discord-client-id:latest,GUILD_ID=discord-guild-id:latest,GOOGLE_API_KEY=google-api-key:latest
 
       - name: Get Service URL
