@@ -29,8 +29,17 @@ const resolvedFfmpegPath = (() => {
 })();
 console.log(`🎬 Using ffmpeg binary: ${resolvedFfmpegPath}`);
 
+// Transcoding and transcription tunables (override via env)
+const MP3_BITRATE_K = Number(process.env.MP3_BITRATE_K || 96); // kbps; 96 is good for voice
+const PROACTIVE_CHUNK_MB = Number(process.env.PROACTIVE_CHUNK_MB || 12); // chunk files larger than this
+const DEFAULT_CHUNK_SECONDS = Number(process.env.CHUNK_SECONDS || 120);
+
 // Store active recordings
 const activeRecordings = new Map();
+
+// Tuning constants for capture reliability
+const SILENCE_CLOSE_MS = 1000; // was 100ms – increased to avoid clipping tail of speech
+const FINAL_FLUSH_DELAY_MS = 3000; // wait longer before processing after stop
 
 export async function handleVoiceCommand(interaction) {
   const action = interaction.options.getString('action');
@@ -88,52 +97,53 @@ async function startRecording(interaction, voiceChannel) {
 
     activeRecordings.set(guildId, recordingData);
 
-    // Listen for users speaking
-    connection.receiver.speaking.on('start', (userId) => {
+    // Continuous per-user aggregation approach to reduce lost chunks
+    connection.receiver.speaking.on('start', async (userId) => {
       if (!activeRecordings.has(guildId)) return;
-
       const user = voiceChannel.guild.members.cache.get(userId);
-      console.log(`🎤 ${user?.displayName || user?.user.tag || userId} started speaking`);
-
-      const audioStream = connection.receiver.subscribe(userId, {
-        end: {
-          behavior: EndBehaviorType.AfterSilence,
-          duration: 100,
-        },
-      });
-
-      const timestamp = Date.now();
-      const filename = `user_${userId}_${timestamp}.pcm`;
       const recordingsDir = path.join(process.cwd(), 'recordings', guildId);
-
-      // Ensure directory exists
       if (!existsSync(recordingsDir)) {
-        mkdir(recordingsDir, { recursive: true });
+        await mkdir(recordingsDir, { recursive: true }).catch(console.error);
       }
 
-      const filePath = path.join(recordingsDir, filename);
-      const out = createWriteStream(filePath);
+      // If already tracking user with a persistent subscription, skip creating another
+      const existing = recordingData.audioStreams.get(userId);
+      if (existing && existing.persistent) {
+        return; // subscription already active
+      }
 
-      // Decode opus to PCM
+      console.log(`🎤 (persistent) ${user?.displayName || user?.user.tag || userId} started speaking`);
+
+      // Create a single PCM file for entire session for this user
+      const aggregatedFilename = `user_${userId}_full.pcm`;
+      const aggregatedPath = path.join(recordingsDir, aggregatedFilename);
+      const aggregatedOut = createWriteStream(aggregatedPath, { flags: 'a' }); // append if exists
+
+      // Manual end so stream stays available across pauses; Discord only sends frames when user speaks
+      const audioStream = connection.receiver.subscribe(userId, {
+        end: { behavior: EndBehaviorType.Manual },
+      });
+
       const decoder = new prism.opus.Decoder({
         frameSize: 960,
         channels: 2,
         rate: 48000,
       });
 
-      pipeline(audioStream, decoder, out, (err) => {
+      pipeline(audioStream, decoder, aggregatedOut, (err) => {
         if (err) {
-          console.error(`Error recording ${user?.displayName || user?.user.tag}:`, err);
+          console.error(`Error (persistent) recording ${user?.displayName || user?.user.tag}:`, err);
         } else {
-          console.log(`✅ Saved recording: ${filename}`);
+          console.log(`✅ Updated aggregated recording for ${user?.displayName || user?.user.tag || userId}`);
         }
       });
 
-      // Store all recordings per user (not just the last one)
-      if (!recordingData.audioStreams.has(userId)) {
-        recordingData.audioStreams.set(userId, { user, files: [] });
-      }
-      recordingData.audioStreams.get(userId).files.push({ filename, filePath });
+      recordingData.audioStreams.set(userId, {
+        user,
+        files: [], // legacy field retained for backward compatibility
+        persistent: true,
+        aggregatedPath,
+      });
     });
 
     await interaction.editReply({
@@ -207,7 +217,7 @@ async function stopRecording(interaction, voiceChannel) {
             content: '❌ Error processing recordings.',
           }).catch(console.error);
         }
-      }, 2000); // Wait 2 seconds for files to be fully written
+      }, FINAL_FLUSH_DELAY_MS); // Wait for writes to flush
     } else {
       await interaction.followUp({
         content: '📭 No audio was captured during this recording session.',
@@ -237,32 +247,47 @@ async function processRecordings(guildId, recordingData, interaction) {
 
   let allTranscriptions = '';
 
-  for (const [userId, { user, files }] of userRecordings) {
+  for (const [userId, record] of userRecordings) {
+    const { user, files = [], persistent, aggregatedPath } = record;
     try {
-      if (files.length === 0) continue;
+      // Persistent mode: we have a single aggregated file
+      let useAggregatedDirectly = false;
+      if (persistent && aggregatedPath && existsSync(aggregatedPath)) {
+        useAggregatedDirectly = true;
+      }
+
+      if (!useAggregatedDirectly && files.length === 0) continue;
 
       // Merge all PCM files for this user into one
-      const mergedPcmPath = path.join(recordingsDir, `user_${userId}_merged.pcm`);
+      const mergedPcmPath = useAggregatedDirectly
+        ? aggregatedPath
+        : path.join(recordingsDir, `user_${userId}_merged.pcm`);
       const mergedMp3Path = path.join(recordingsDir, `user_${userId}_merged.mp3`);
 
       // Concatenate all PCM files
-      const pcmPaths = files.map(f => f.filePath).filter(p => existsSync(p));
-      
+      const pcmPaths = useAggregatedDirectly
+        ? [aggregatedPath]
+        : files.map(f => f.filePath).filter(p => existsSync(p));
+
       if (pcmPaths.length === 0) continue;
 
       // Merge PCM files by concatenating binary data
-      console.log(`🔄 Merging ${pcmPaths.length} recording(s) for ${user?.displayName || user?.user.tag || userId}...`);
-      
-      if (pcmPaths.length === 1) {
-        // Only one file, just copy it
-        const data = await readFile(pcmPaths[0]);
-        await writeFile(mergedPcmPath, data);
+      if (!useAggregatedDirectly) {
+        console.log(`🔄 Merging ${pcmPaths.length} recording(s) for ${user?.displayName || user?.user.tag || userId}...`);
       } else {
-        // Multiple files, concatenate them
-        await writeFile(mergedPcmPath, Buffer.alloc(0)); // Create empty file
-        for (const pcmPath of pcmPaths) {
-          const data = await readFile(pcmPath);
-          await appendFile(mergedPcmPath, data);
+        console.log(`🔄 Using aggregated recording for ${user?.displayName || user?.user.tag || userId}`);
+      }
+      
+      if (!useAggregatedDirectly) {
+        if (pcmPaths.length === 1) {
+          const data = await readFile(pcmPaths[0]);
+          await writeFile(mergedPcmPath, data);
+        } else {
+          await writeFile(mergedPcmPath, Buffer.alloc(0));
+          for (const pcmPath of pcmPaths) {
+            const data = await readFile(pcmPath);
+            await appendFile(mergedPcmPath, data);
+          }
         }
       }
 
@@ -285,7 +310,7 @@ async function processRecordings(guildId, recordingData, interaction) {
         console.log(`🔄 Converting to MP3...`);
         
         const { stdout, stderr } = await execAsync(
-          `"${resolvedFfmpegPath}" -y -f s16le -ar 48000 -ac 2 -i "${mergedPcmPath}" -b:a 128k "${mergedMp3Path}"`,
+          `"${resolvedFfmpegPath}" -y -f s16le -ar 48000 -ac 2 -i "${mergedPcmPath}" -b:a ${MP3_BITRATE_K}k "${mergedMp3Path}"`,
           { timeout: 90000, maxBuffer: 10 * 1024 * 1024 } // 90s timeout, larger buffer for stderr
         );
         
@@ -295,31 +320,58 @@ async function processRecordings(guildId, recordingData, interaction) {
 
         // Send the MP3 file
         await interaction.followUp({
-          content: `🎵 Recording from ${user?.displayName || 'Unknown'} (${pcmPaths.length} segment${pcmPaths.length > 1 ? 's' : ''})`,
+          content: `🎵 Recording from ${user?.displayName || 'Unknown'} (${useAggregatedDirectly ? 'aggregated stream' : pcmPaths.length + ' segment' + (pcmPaths.length > 1 ? 's' : '')})`,
           files: [mergedMp3Path],
         });
 
-        // Transcribe the audio (with chunked fallback on network errors)
-        let transcription = await transcribeAudio(mergedMp3Path);
-        if (!transcription) {
-          console.log('⚠️ Full-file transcription failed. Attempting chunked transcription fallback...');
-          const chunks = await splitAudioIntoChunks(mergedMp3Path, recordingsDir, userId, 120);
+        // Decide whether to transcribe whole file or proactively chunk based on file size
+        const { size: mp3Bytes } = await stat(mergedMp3Path).catch(() => ({ size: 0 }));
+        const mp3MB = mp3Bytes / (1024 * 1024);
+        const shouldChunkProactively = mp3MB > PROACTIVE_CHUNK_MB;
+
+        let transcription = '';
+        if (shouldChunkProactively) {
+          console.log(`🔪 Proactively chunking audio (~${mp3MB.toFixed(2)} MB > ${PROACTIVE_CHUNK_MB} MB)...`);
+          const chunks = await splitAudioIntoChunks(mergedMp3Path, recordingsDir, userId, DEFAULT_CHUNK_SECONDS);
           if (chunks.length > 0) {
-            let combined = '';
             for (let i = 0; i < chunks.length; i++) {
               const chunkPath = chunks[i];
               const partText = await transcribeAudio(chunkPath);
               if (partText) {
-                combined += partText + '\n';
+                transcription += partText + '\n';
               } else {
                 console.warn(`⚠️ Transcription failed for chunk #${i + 1}`);
               }
-              // Clean up chunk as we go
               await unlink(chunkPath).catch(console.error);
             }
-            transcription = combined.trim();
+            transcription = transcription.trim();
           } else {
-            console.warn('⚠️ No chunks were produced for fallback transcription.');
+            console.warn('⚠️ No chunks were produced for proactive transcription; attempting whole-file transcription.');
+            transcription = await transcribeAudio(mergedMp3Path);
+          }
+        } else {
+          // Transcribe the audio (with chunked fallback on network errors)
+          transcription = await transcribeAudio(mergedMp3Path);
+          if (!transcription) {
+            console.log('⚠️ Full-file transcription failed. Attempting chunked transcription fallback...');
+            const chunks = await splitAudioIntoChunks(mergedMp3Path, recordingsDir, userId, DEFAULT_CHUNK_SECONDS);
+            if (chunks.length > 0) {
+              let combined = '';
+              for (let i = 0; i < chunks.length; i++) {
+                const chunkPath = chunks[i];
+                const partText = await transcribeAudio(chunkPath);
+                if (partText) {
+                  combined += partText + '\n';
+                } else {
+                  console.warn(`⚠️ Transcription failed for chunk #${i + 1}`);
+                }
+                // Clean up chunk as we go
+                await unlink(chunkPath).catch(console.error);
+              }
+              transcription = combined.trim();
+            } else {
+              console.warn('⚠️ No chunks were produced for fallback transcription.');
+            }
           }
         }
 
@@ -328,10 +380,15 @@ async function processRecordings(guildId, recordingData, interaction) {
         }
 
         // Clean up PCM files
-        for (const { filePath } of files) {
-          await unlink(filePath).catch(console.error);
+        if (!useAggregatedDirectly) {
+          for (const { filePath } of files) {
+            await unlink(filePath).catch(console.error);
+          }
+          await unlink(mergedPcmPath).catch(console.error);
+        } else {
+          // In aggregated mode, remove the source aggregated PCM now that we have MP3
+          await unlink(aggregatedPath).catch(console.error);
         }
-        await unlink(mergedPcmPath).catch(console.error);
       } catch (conversionError) {
         console.error(`Error converting merged recording:`, conversionError);
         await interaction.followUp({
