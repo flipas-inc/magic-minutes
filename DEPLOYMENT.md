@@ -272,12 +272,23 @@ Estimated cost: ~$5-15/month depending on voice recording usage
 1. Check Cloud Build logs
 2. Verify all APIs are enabled
 3. Ensure service account has correct permissions
+4. **Build timeout**: Cloud Build may take 5-10 minutes due to native module compilation
+
+### Build Requirements
+
+The Docker image uses Node.js 22 (Debian slim) and includes:
+- Native module build tools (python3, make, g++)
+- libopus for audio encoding/decoding
+- libsodium for Discord voice encryption
+- ffmpeg for audio processing
+
+**Note**: The Docker image is ~1.7GB due to these dependencies. This is normal for Discord bots with voice capabilities.
 
 ### Voice recording issues
 
-1. Check memory allocation (may need 1GB for multiple users)
+1. Check memory allocation (increase to 1GB for multiple users if needed)
 2. Review Cloud Run logs during recording
-3. Verify ffmpeg-static is working in container
+3. Verify ffmpeg is working in container
 
 ---
 
