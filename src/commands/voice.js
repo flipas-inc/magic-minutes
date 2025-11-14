@@ -37,9 +37,12 @@ const DEFAULT_CHUNK_SECONDS = Number(process.env.CHUNK_SECONDS || 120);
 // Store active recordings
 const activeRecordings = new Map();
 
-// Tuning constants for capture reliability
+// Tuning constants for capture reliability and robustness
 const SILENCE_CLOSE_MS = 1000; // was 100ms – increased to avoid clipping tail of speech
-const FINAL_FLUSH_DELAY_MS = 3000; // wait longer before processing after stop
+const FINAL_FLUSH_DELAY_MS = 5000; // wait longer before processing after stop (increased for large files)
+const STREAM_FLUSH_INTERVAL_MS = 30000; // flush write streams every 30s to prevent data loss
+const MAX_RECONNECT_ATTEMPTS = 3; // reconnection attempts if connection drops
+const STREAM_HIGH_WATER_MARK = 64 * 1024; // 64KB buffer for write streams (helps with concurrent writes)
 
 export async function handleVoiceCommand(interaction) {
   const action = interaction.options.getString('action');
@@ -93,9 +96,42 @@ async function startRecording(interaction, voiceChannel) {
       audioStreams: new Map(),
       voiceChannel,
       interaction,
+      flushIntervals: new Map(), // Track flush intervals per user
+      reconnectAttempts: 0,
     };
 
     activeRecordings.set(guildId, recordingData);
+
+    // Monitor connection status and attempt recovery
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      console.warn('⚠️ Voice connection disconnected, attempting recovery...');
+      try {
+        await Promise.race([
+          connection.reconnect(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Reconnection timeout')), 5000)),
+        ]);
+        console.log('✅ Voice connection recovered');
+      } catch (error) {
+        console.error('❌ Failed to recover connection:', error);
+        if (recordingData.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          recordingData.reconnectAttempts++;
+          console.log(`🔄 Reconnection attempt ${recordingData.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+        } else {
+          console.error('❌ Max reconnection attempts reached, stopping recording');
+          connection.destroy();
+          activeRecordings.delete(guildId);
+        }
+      }
+    });
+
+    connection.on(VoiceConnectionStatus.Destroyed, () => {
+      console.log('🔌 Voice connection destroyed');
+      // Cleanup flush intervals
+      if (recordingData.flushIntervals) {
+        recordingData.flushIntervals.forEach(interval => clearInterval(interval));
+        recordingData.flushIntervals.clear();
+      }
+    });
 
     // Continuous per-user aggregation approach to reduce lost chunks
     connection.receiver.speaking.on('start', async (userId) => {
@@ -117,7 +153,10 @@ async function startRecording(interaction, voiceChannel) {
       // Create a single PCM file for entire session for this user
       const aggregatedFilename = `user_${userId}_full.pcm`;
       const aggregatedPath = path.join(recordingsDir, aggregatedFilename);
-      const aggregatedOut = createWriteStream(aggregatedPath, { flags: 'a' }); // append if exists
+      const aggregatedOut = createWriteStream(aggregatedPath, { 
+        flags: 'a', // append if exists
+        highWaterMark: STREAM_HIGH_WATER_MARK, // larger buffer for concurrent writes
+      });
 
       // Manual end so stream stays available across pauses; Discord only sends frames when user speaks
       const audioStream = connection.receiver.subscribe(userId, {
@@ -130,20 +169,83 @@ async function startRecording(interaction, voiceChannel) {
         rate: 48000,
       });
 
+      let streamActive = true;
+      let bytesWritten = 0;
+
+      // Handle stream errors gracefully without breaking the pipeline
+      audioStream.on('error', (err) => {
+        // Log but don't crash - streams may close when users disconnect
+        if (err.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+          console.error(`Audio stream error for ${user?.displayName || user?.user.tag}:`, err);
+        }
+        streamActive = false;
+      });
+
+      decoder.on('error', (err) => {
+        console.error(`Decoder error for ${user?.displayName || user?.user.tag}:`, err);
+        // Try to recover by recreating the decoder if possible
+        streamActive = false;
+      });
+
+      aggregatedOut.on('error', (err) => {
+        console.error(`Write stream error for ${user?.displayName || user?.user.tag}:`, err);
+        streamActive = false;
+      });
+
+      // Track bytes written for monitoring
+      aggregatedOut.on('drain', () => {
+        // Buffer has drained, can write more
+      });
+
+      // Monitor data flow
+      decoder.on('data', (chunk) => {
+        bytesWritten += chunk.length;
+      });
+
       pipeline(audioStream, decoder, aggregatedOut, (err) => {
-        if (err) {
-          console.error(`Error (persistent) recording ${user?.displayName || user?.user.tag}:`, err);
-        } else {
-          console.log(`✅ Updated aggregated recording for ${user?.displayName || user?.user.tag || userId}`);
+        streamActive = false;
+        if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+          console.error(`Pipeline error for ${user?.displayName || user?.user.tag}:`, err);
+        }
+        console.log(`📊 Total bytes written for ${user?.displayName || user?.user.tag}: ${(bytesWritten / 1024).toFixed(2)} KB`);
+        
+        // Clear flush interval for this user
+        const flushInterval = recordingData.flushIntervals?.get(userId);
+        if (flushInterval) {
+          clearInterval(flushInterval);
+          recordingData.flushIntervals.delete(userId);
         }
       });
+
+      // Periodic flush to ensure data is written to disk (critical for long recordings)
+      const flushInterval = setInterval(() => {
+        if (streamActive && !aggregatedOut.destroyed) {
+          // Force flush by corking and uncorking
+          aggregatedOut.cork();
+          setImmediate(() => {
+            if (!aggregatedOut.destroyed) {
+              aggregatedOut.uncork();
+              console.log(`💾 Flushed stream for ${user?.displayName || user?.user.tag} (${(bytesWritten / 1024).toFixed(2)} KB total)`);
+            }
+          });
+        } else {
+          clearInterval(flushInterval);
+          recordingData.flushIntervals?.delete(userId);
+        }
+      }, STREAM_FLUSH_INTERVAL_MS);
 
       recordingData.audioStreams.set(userId, {
         user,
         files: [], // legacy field retained for backward compatibility
         persistent: true,
         aggregatedPath,
+        stream: audioStream,
+        writeStream: aggregatedOut,
+        decoder: decoder,
+        startTime: Date.now(),
       });
+
+      recordingData.flushIntervals?.set(userId, flushInterval);
     });
 
     await interaction.editReply({
@@ -183,6 +285,52 @@ async function stopRecording(interaction, voiceChannel) {
   }
 
   try {
+    // Properly finalize all active streams before destroying connection
+    if (recordingData && recordingData.audioStreams.size > 0) {
+      console.log(`🔄 Finalizing ${recordingData.audioStreams.size} active stream(s)...`);
+      
+      // Stop all flush intervals first
+      if (recordingData.flushIntervals) {
+        recordingData.flushIntervals.forEach(interval => clearInterval(interval));
+        recordingData.flushIntervals.clear();
+      }
+
+      // Gracefully close all streams
+      const closePromises = [];
+      for (const [userId, streamData] of recordingData.audioStreams.entries()) {
+        const { writeStream, stream: audioStream, user } = streamData;
+        
+        closePromises.push(
+          new Promise((resolve) => {
+            if (writeStream && !writeStream.destroyed) {
+              // Ensure all data is flushed
+              writeStream.end(() => {
+                console.log(`✅ Closed stream for ${user?.displayName || user?.user.tag || userId}`);
+                resolve();
+              });
+              // Force close after timeout to prevent hanging
+              setTimeout(() => {
+                if (!writeStream.destroyed) {
+                  writeStream.destroy();
+                  resolve();
+                }
+              }, 2000);
+            } else {
+              resolve();
+            }
+          })
+        );
+      }
+
+      // Wait for all streams to close, with timeout
+      await Promise.race([
+        Promise.all(closePromises),
+        new Promise(resolve => setTimeout(resolve, 3000)), // max 3s wait
+      ]);
+      
+      console.log('✅ All streams finalized');
+    }
+
     // Destroy connection if it exists
     if (connection) {
       connection.destroy();
@@ -246,17 +394,33 @@ async function processRecordings(guildId, recordingData, interaction) {
   }
 
   let allTranscriptions = '';
+  let successfulProcessing = 0;
+  let failedProcessing = 0;
 
   for (const [userId, record] of userRecordings) {
-    const { user, files = [], persistent, aggregatedPath } = record;
+    const { user, files = [], persistent, aggregatedPath, startTime } = record;
     try {
+      const userDisplayName = user?.displayName || user?.user?.tag || userId;
+      
       // Persistent mode: we have a single aggregated file
       let useAggregatedDirectly = false;
       if (persistent && aggregatedPath && existsSync(aggregatedPath)) {
-        useAggregatedDirectly = true;
+        // Verify file is not empty and is readable
+        const { size } = await stat(aggregatedPath).catch(() => ({ size: 0 }));
+        if (size > 0) {
+          useAggregatedDirectly = true;
+          const recordingDuration = startTime ? Math.floor((Date.now() - startTime) / 1000) : 0;
+          console.log(`✅ Found recording for ${userDisplayName}: ${(size / 1024).toFixed(2)} KB (${recordingDuration}s)`);
+        } else {
+          console.warn(`⚠️ Empty recording file for ${userDisplayName}, skipping`);
+          continue;
+        }
       }
 
-      if (!useAggregatedDirectly && files.length === 0) continue;
+      if (!useAggregatedDirectly && files.length === 0) {
+        console.log(`ℹ️ No recordings for ${userDisplayName}`);
+        continue;
+      }
 
       // Merge all PCM files for this user into one
       const mergedPcmPath = useAggregatedDirectly
@@ -307,22 +471,33 @@ async function processRecordings(guildId, recordingData, interaction) {
 
       // Convert merged PCM to MP3
       try {
-        console.log(`🔄 Converting to MP3...`);
+        console.log(`🔄 Converting to MP3 for ${userDisplayName}...`);
+        
+        // Calculate reasonable timeout based on file size (at least 90s, up to 5 minutes)
+        const timeoutMs = Math.max(90000, Math.min(300000, mergedSize / 1024)); // 1s per KB, capped at 5 min
         
         const { stdout, stderr } = await execAsync(
           `"${resolvedFfmpegPath}" -y -f s16le -ar 48000 -ac 2 -i "${mergedPcmPath}" -b:a ${MP3_BITRATE_K}k "${mergedMp3Path}"`,
-          { timeout: 90000, maxBuffer: 10 * 1024 * 1024 } // 90s timeout, larger buffer for stderr
+          { timeout: timeoutMs, maxBuffer: 20 * 1024 * 1024 } // larger buffer for stderr
         );
         
-        if (stderr) console.log('FFmpeg output:', stderr);
+        if (stderr && stderr.includes('error')) {
+          console.warn('FFmpeg warnings:', stderr);
+        }
         
-        console.log(`✅ Converted merged recording to MP3`);
+        // Verify MP3 was created and is not empty
+        const { size: mp3Size } = await stat(mergedMp3Path).catch(() => ({ size: 0 }));
+        if (mp3Size === 0) {
+          throw new Error('MP3 conversion produced empty file');
+        }
+        
+        console.log(`✅ Converted to MP3: ${(mp3Size / 1024).toFixed(2)} KB`);
 
         // Send the MP3 file
-        await interaction.followUp({
-          content: `🎵 Recording from ${user?.displayName || 'Unknown'} (${useAggregatedDirectly ? 'aggregated stream' : pcmPaths.length + ' segment' + (pcmPaths.length > 1 ? 's' : '')})`,
-          files: [mergedMp3Path],
-        });
+        // await interaction.followUp({
+        //   content: `🎵 Recording from ${user?.displayName || 'Unknown'} (${useAggregatedDirectly ? 'aggregated stream' : pcmPaths.length + ' segment' + (pcmPaths.length > 1 ? 's' : '')})`,
+        //   files: [mergedMp3Path],
+        // });
 
         // Decide whether to transcribe whole file or proactively chunk based on file size
         const { size: mp3Bytes } = await stat(mergedMp3Path).catch(() => ({ size: 0 }));
@@ -391,31 +566,62 @@ async function processRecordings(guildId, recordingData, interaction) {
         }
       } catch (conversionError) {
         console.error(`Error converting merged recording:`, conversionError);
+        failedProcessing++;
         await interaction.followUp({
           content: `⚠️ Could not convert recording from ${user?.displayName || 'Unknown'}`,
         });
+        // Continue to next user instead of stopping
+        continue;
       }
+      
+      successfulProcessing++;
     } catch (error) {
       console.error(`Error processing recordings for user ${userId}:`, error);
+      failedProcessing++;
+      // Continue to next user
     }
   }
 
-  // Send transcriptions
+  // Log processing summary
+  console.log(`📊 Processing complete: ${successfulProcessing} successful, ${failedProcessing} failed`);
+
+  // Send transcriptions and summary even if some recordings failed
   if (allTranscriptions) {
-    const chunks = splitMessage(allTranscriptions, 2000);
-    for (const chunk of chunks) {
+    const chunks = splitMessage(allTranscriptions, 1950); // Leave room for "📝 **Transcription:**\n" prefix
+    for (let i = 0; i < chunks.length; i++) {
+      const prefix = i === 0 ? '📝 **Transcription:**\n' : '📝 **Transcription (continued):**\n';
       await interaction.followUp({
-        content: `📝 **Transcription:**\n${chunk}`,
+        content: `${prefix}${chunks[i]}`,
       });
     }
 
     // Generate and send summary
-    const summary = await summarizeText(allTranscriptions);
-    if (summary) {
+    try {
+      const summary = await summarizeText(allTranscriptions);
+      if (summary) {
+        // Split summary into chunks if it's too long
+        const summaryChunks = splitMessage(summary, 1950); // Leave room for "📊 **Summary:**\n" prefix
+        for (let i = 0; i < summaryChunks.length; i++) {
+          const prefix = i === 0 ? '📊 **Summary:**\n' : '📊 **Summary (continued):**\n';
+          await interaction.followUp({
+            content: `${prefix}${summaryChunks[i]}`,
+          });
+        }
+      } else {
+        await interaction.followUp({
+          content: '⚠️ Could not generate summary.',
+        });
+      }
+    } catch (summaryError) {
+      console.error('Error generating summary:', summaryError);
       await interaction.followUp({
-        content: `📊 **Summary:**\n${summary}`,
+        content: '⚠️ Error generating summary.',
       });
     }
+  } else if (failedProcessing > 0) {
+    await interaction.followUp({
+      content: `⚠️ All ${failedProcessing} recording(s) failed to process. No transcriptions available.`,
+    });
   } else {
     await interaction.followUp({
       content: '⚠️ No transcription could be generated from the recordings.',
@@ -429,15 +635,43 @@ function splitMessage(text, maxLength = 2000) {
 
   const lines = text.split('\n');
   for (const line of lines) {
-    if ((currentChunk + line + '\n').length > maxLength) {
-      if (currentChunk) chunks.push(currentChunk);
+    // If a single line is longer than maxLength, split it by words
+    if (line.length > maxLength) {
+      // First, add current chunk if it has content
+      if (currentChunk) {
+        chunks.push(currentChunk);
+        currentChunk = '';
+      }
+      
+      // Split long line by words
+      const words = line.split(' ');
+      let tempLine = '';
+      for (const word of words) {
+        if ((tempLine + word + ' ').length > maxLength) {
+          if (tempLine) {
+            chunks.push(tempLine.trim());
+            tempLine = word + ' ';
+          } else {
+            // Single word longer than maxLength, force split
+            chunks.push(word.substring(0, maxLength));
+            tempLine = word.substring(maxLength) + ' ';
+          }
+        } else {
+          tempLine += word + ' ';
+        }
+      }
+      if (tempLine) {
+        currentChunk = tempLine.trim() + '\n';
+      }
+    } else if ((currentChunk + line + '\n').length > maxLength) {
+      if (currentChunk) chunks.push(currentChunk.trim());
       currentChunk = line + '\n';
     } else {
       currentChunk += line + '\n';
     }
   }
 
-  if (currentChunk) chunks.push(currentChunk);
+  if (currentChunk) chunks.push(currentChunk.trim());
   return chunks;
 }
 
