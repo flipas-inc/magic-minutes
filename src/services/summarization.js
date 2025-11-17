@@ -16,7 +16,7 @@ export async function summarizeText(text) {
 
     const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
-    const prompt = `You are a helpful assistant that creates concise summaries of voice chat transcriptions. Focus on key points, decisions made, and action items.
+    const prompt = `You are a helpful assistant that creates concise summaries of voice chat transcriptions from a team called Flipas that is currently working on two main projects: Sombra and Aurora. Focus on key points, decisions made, and action items.
 
 Please summarize the following voice chat transcription:
 
