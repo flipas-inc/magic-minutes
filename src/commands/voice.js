@@ -98,6 +98,7 @@ async function startRecording(interaction, voiceChannel) {
       interaction,
       flushIntervals: new Map(), // Track flush intervals per user
       reconnectAttempts: 0,
+      voiceStateHandler: null, // Will be set below
     };
 
     activeRecordings.set(guildId, recordingData);
@@ -130,6 +131,11 @@ async function startRecording(interaction, voiceChannel) {
       if (recordingData.flushIntervals) {
         recordingData.flushIntervals.forEach(interval => clearInterval(interval));
         recordingData.flushIntervals.clear();
+      }
+      // Remove voice state listener
+      if (recordingData.voiceStateHandler) {
+        voiceChannel.guild.client.removeListener('voiceStateUpdate', recordingData.voiceStateHandler);
+        recordingData.voiceStateHandler = null;
       }
     });
 
@@ -248,6 +254,23 @@ async function startRecording(interaction, voiceChannel) {
       recordingData.flushIntervals?.set(userId, flushInterval);
     });
 
+    // Monitor voice state changes to handle users leaving the channel
+    const voiceStateHandler = async (oldState, newState) => {
+      // Only process if recording is still active
+      if (!activeRecordings.has(guildId)) return;
+      
+      const userId = newState.id;
+      const leftChannel = oldState.channelId === voiceChannel.id && newState.channelId !== voiceChannel.id;
+      
+      if (leftChannel && recordingData.audioStreams.has(userId)) {
+        console.log(`👋 User ${newState.member?.displayName || userId} left the voice channel, finalizing their recording...`);
+        await finalizeUserRecording(guildId, userId, recordingData);
+      }
+    };
+
+    recordingData.voiceStateHandler = voiceStateHandler;
+    voiceChannel.guild.client.on('voiceStateUpdate', voiceStateHandler);
+
     await interaction.editReply({
       content: `✅ Started recording in ${voiceChannel.name}! Use /record stop when finished.`,
     });
@@ -285,6 +308,12 @@ async function stopRecording(interaction, voiceChannel) {
   }
 
   try {
+    // Remove voice state listener
+    if (recordingData && recordingData.voiceStateHandler) {
+      voiceChannel.guild.client.removeListener('voiceStateUpdate', recordingData.voiceStateHandler);
+      recordingData.voiceStateHandler = null;
+    }
+
     // Properly finalize all active streams before destroying connection
     if (recordingData && recordingData.audioStreams.size > 0) {
       console.log(`🔄 Finalizing ${recordingData.audioStreams.size} active stream(s)...`);
@@ -473,8 +502,12 @@ async function processRecordings(guildId, recordingData, interaction) {
       try {
         console.log(`🔄 Converting to MP3 for ${userDisplayName}...`);
         
-        // Calculate reasonable timeout based on file size (at least 90s, up to 5 minutes)
-        const timeoutMs = Math.max(90000, Math.min(300000, mergedSize / 1024)); // 1s per KB, capped at 5 min
+        // Calculate reasonable timeout based on file size
+        // Large files need more time: ~500ms per MB of PCM, minimum 90s, max 10 minutes
+        const mergedSizeMB = mergedSize / (1024 * 1024);
+        const timeoutMs = Math.floor(Math.max(90000, Math.min(600000, mergedSizeMB * 500)));
+        
+        console.log(`⏱️ FFmpeg timeout set to ${(timeoutMs / 1000).toFixed(1)}s for ${mergedSizeMB.toFixed(2)} MB file`);
         
         const { stdout, stderr } = await execAsync(
           `"${resolvedFfmpegPath}" -y -f s16le -ar 48000 -ac 2 -i "${mergedPcmPath}" -b:a ${MP3_BITRATE_K}k "${mergedMp3Path}"`,
@@ -673,6 +706,40 @@ function splitMessage(text, maxLength = 2000) {
 
   if (currentChunk) chunks.push(currentChunk.trim());
   return chunks;
+}
+
+// Finalize a single user's recording (called when they leave or when stopping)
+async function finalizeUserRecording(guildId, userId, recordingData) {
+  const streamData = recordingData.audioStreams.get(userId);
+  if (!streamData) return;
+
+  const { writeStream, stream: audioStream, user, decoder } = streamData;
+
+  // Clear flush interval for this user
+  const flushInterval = recordingData.flushIntervals?.get(userId);
+  if (flushInterval) {
+    clearInterval(flushInterval);
+    recordingData.flushIntervals.delete(userId);
+  }
+
+  // Gracefully close the write stream
+  return new Promise((resolve) => {
+    if (writeStream && !writeStream.destroyed) {
+      writeStream.end(() => {
+        console.log(`✅ Finalized recording for ${user?.displayName || user?.user?.tag || userId}`);
+        resolve();
+      });
+      // Force close after timeout to prevent hanging
+      setTimeout(() => {
+        if (!writeStream.destroyed) {
+          writeStream.destroy();
+          resolve();
+        }
+      }, 2000);
+    } else {
+      resolve();
+    }
+  });
 }
 
 // Split an audio file into smaller chunks to avoid large upload failures
