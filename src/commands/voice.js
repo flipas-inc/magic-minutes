@@ -620,13 +620,13 @@ async function processRecordings(guildId, recordingData, interaction) {
 
   // Send transcriptions and summary even if some recordings failed
   if (allTranscriptions) {
-    const chunks = splitMessage(allTranscriptions, 1950); // Leave room for "📝 **Transcription:**\n" prefix
-    for (let i = 0; i < chunks.length; i++) {
-      const prefix = i === 0 ? '📝 **Transcription:**\n' : '📝 **Transcription (continued):**\n';
-      await interaction.followUp({
-        content: `${prefix}${chunks[i]}`,
-      });
-    }
+    // const chunks = splitMessage(allTranscriptions, 1950); // Leave room for "📝 **Transcription:**\n" prefix
+    // for (let i = 0; i < chunks.length; i++) {
+    //   const prefix = i === 0 ? '📝 **Transcription:**\n' : '📝 **Transcription (continued):**\n';
+    //   await interaction.followUp({
+    //     content: `${prefix}${chunks[i]}`,
+    //   });
+    // }
 
     // Generate and send summary
     try {
